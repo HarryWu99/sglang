@@ -10,7 +10,7 @@ import math
 import inspect
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.zigzag_ops.zigzag_attn_interface import zigzag_attn_with_kvcache, zigzag_attn_varlen_func
+from sglang.srt.layers.attention.zigzag_ops.zigzag_attn_interface import zigzag_attn_varlen_func, get_splits, zigzag_attn_with_kvcache 
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
+
 @dataclass
 class ForwardMetadata:
     cu_seqlens_q: torch.Tensor = None
@@ -32,8 +33,12 @@ class ForwardMetadata:
     page_table: torch.Tensor = None
     max_seq_len_q: int = 1
     max_seq_len_k: int = 1
+    full_num_splits: int = 1
+    streaming_num_splits: int = 1
+
 
 PAGE_SIZE = 64    
+
 
 class ZigZagAttnBackend(AttentionBackend):
     def __init__(
@@ -79,6 +84,7 @@ class ZigZagAttnBackend(AttentionBackend):
             device=model_runner.device,
             dtype=torch.int32,
         )
+        self.streaming_info_cpu = [num_sink_blocks, num_recent_blocks]
         self.head_mask = torch.full((self.local_q_head,), -1, device=model_runner.device, dtype=torch.int32)
         if model_runner.is_draft_worker:
             self.layers_type = "1" * model_config.num_attention_layers
@@ -101,6 +107,7 @@ class ZigZagAttnBackend(AttentionBackend):
         
         q_head = layer.tp_q_head_num
         streaming_info = self.streaming_info if self.layers_type[layer.layer_id] == '1' else None
+        num_splits = self.forward_metadata.streaming_num_splits if self.layers_type[layer.layer_id] == '1' else self.forward_metadata.full_num_splits
         
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             if not any(forward_batch.extend_prefix_lens_cpu):
@@ -167,6 +174,7 @@ class ZigZagAttnBackend(AttentionBackend):
                 layer.v_head_dim,
                 layer.scaling,
                 causal=True,
+                num_splits=num_splits,
                 streaming_info=streaming_info,
                 head_mask_type=self.head_mask,
             )
@@ -191,6 +199,7 @@ class ZigZagAttnBackend(AttentionBackend):
         q_head = layer.tp_q_head_num
         kv_head = layer.tp_k_head_num
         streaming_info = self.streaming_info if self.layers_type[layer.layer_id] == '1' else None
+        num_splits = self.forward_metadata.streaming_num_splits if self.layers_type[layer.layer_id] == '1' else self.forward_metadata.full_num_splits
 
         k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         k_buffer = k_buffer.unflatten(0, (-1, forward_batch.token_to_kv_pool.page_size))
@@ -204,6 +213,7 @@ class ZigZagAttnBackend(AttentionBackend):
             layer.v_head_dim,
             layer.scaling,
             causal=True,
+            num_splits=num_splits,
             streaming_info=streaming_info,
             head_mask_type=self.head_mask,
         )
@@ -227,6 +237,9 @@ class ZigZagAttnBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
+            avg_seq_len_k = forward_batch.seq_lens_cpu.float().mean().int().item()
+            metadata.full_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=None)
+            metadata.streaming_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
         elif forward_batch.forward_mode.is_target_verify():
             metadata.cache_seqlens_int32 = (
                 forward_batch.seq_lens + self.draft_token_num
@@ -244,6 +257,9 @@ class ZigZagAttnBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
+            avg_seq_len_k = forward_batch.seq_lens_cpu.float().mean().int().item()
+            metadata.full_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=None)
+            metadata.streaming_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
         ):
@@ -341,6 +357,10 @@ class ZigZagAttnBackend(AttentionBackend):
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
             )
+            max_seq_len_k = seq_lens.max().item()
+            avg_seq_len_k = seq_lens.float().mean().int().item()
+            full_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=None)
+            streaming_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
         elif forward_mode.is_target_verify():
             seq_lens = seq_lens + self.draft_token_num
             self.cache_seqlens_int32[:bs] = seq_lens
@@ -356,7 +376,12 @@ class ZigZagAttnBackend(AttentionBackend):
                 (1, 0),
             )
             max_seq_len_q = self.draft_token_num
+            max_seq_len_k = seq_lens.max().item()
+            avg_seq_len_k = seq_lens.float().mean().int().item()
+            full_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=None)
+            streaming_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
 
+        max_page_len = (max_seq_len_k + PAGE_SIZE - 1) // PAGE_SIZE
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -366,8 +391,6 @@ class ZigZagAttnBackend(AttentionBackend):
             self.req_to_token.stride(0),
             self.page_table.stride(0),
         )
-        max_seq_len_k = seq_lens.max().item()
-        max_page_len = (max_seq_len_k + PAGE_SIZE - 1) // PAGE_SIZE
         self.forward_metadata = ForwardMetadata(
             self.cu_seqlens_q[:bs+1],
             self.cu_seqlens_k[:bs+1],
@@ -375,6 +398,8 @@ class ZigZagAttnBackend(AttentionBackend):
             self.page_table[:bs],
             max_seq_len_q,
             max_seq_len_k,
+            full_num_splits,
+            streaming_num_splits,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -399,6 +424,10 @@ class ZigZagAttnBackend(AttentionBackend):
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
                 (1, 0),
             )
+            max_seq_len_k = seq_lens.max().item()
+            avg_seq_len_k = seq_lens.float().mean().int().item()
+            full_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=None)
+            streaming_num_splits = get_splits(bs, self.num_q_head, 1, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
         elif forward_mode.is_target_verify():
             seq_lens = seq_lens + self.draft_token_num
             self.cache_seqlens_int32[:bs] = seq_lens
@@ -414,7 +443,12 @@ class ZigZagAttnBackend(AttentionBackend):
                 (1, 0),
             )
             max_seq_len_q = self.draft_token_num
+            max_seq_len_k = seq_lens.max().item()
+            avg_seq_len_k = seq_lens.float().mean().int().item()
+            full_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=None)
+            streaming_num_splits = get_splits(bs, self.num_q_head, self.draft_token_num, avg_seq_len_k, streaming_info=self.streaming_info_cpu)
 
+        max_page_len = (max_seq_len_k + PAGE_SIZE - 1) // PAGE_SIZE
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
             req_pool_indices,
@@ -424,8 +458,6 @@ class ZigZagAttnBackend(AttentionBackend):
             self.req_to_token.stride(0),
             self.page_table.stride(0),
         )
-        max_seq_len_k = seq_lens.max().item()
-        max_page_len = (max_seq_len_k + PAGE_SIZE - 1) // PAGE_SIZE
         self.forward_metadata = ForwardMetadata(
             self.cu_seqlens_q[:bs+1],
             self.cu_seqlens_k[:bs+1],
@@ -433,6 +465,8 @@ class ZigZagAttnBackend(AttentionBackend):
             self.page_table[:bs],
             max_seq_len_q,
             max_seq_len_k,
+            full_num_splits,
+            streaming_num_splits,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):

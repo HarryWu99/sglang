@@ -1010,6 +1010,7 @@ def zigzag_attn_with_kvcache(
     dim_nope: int,
     softmax_scale: float,
     causal: bool = True,
+    num_splits: int = 1,
     streaming_info: torch.Tensor = None,
     head_mask_type: torch.Tensor = None,
 ):
@@ -1024,7 +1025,7 @@ def zigzag_attn_with_kvcache(
         block_H = 64
         block_N = 128
         # num_splits = get_splits(batch_size, num_heads_q, seqlen_q, torch.mean(cache_seqlens.float()).int().item(), block_H, block_N, streaming_info[0].cpu().tolist())
-        num_splits = 1
+        # num_splits = 1
         num_stages = 1
         threads = 256
 
@@ -1039,7 +1040,7 @@ def zigzag_attn_with_kvcache(
         block_H = 64
         block_N = 64
         # num_splits = get_splits(batch_size, num_heads_q, seqlen_q, torch.mean(cache_seqlens.float()).int().item(), block_H, block_N, None)
-        num_splits = 1
+        # num_splits = 1
 
         glse = torch.empty(batch_size, seqlen_q, num_heads_q, num_splits, dtype=q.dtype, device=q.device)
         out_partial = torch.empty(batch_size, seqlen_q, num_heads_q, num_splits, dim_nope, dtype=q.dtype, device=q.device)
